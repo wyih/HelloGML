@@ -4,6 +4,7 @@ import {
   createCompletionStream,
   generateImages,
   generateVideos,
+  getTokenChatStreamStatus,
   getTokenLiveStatus,
 } from "./chat.ts";
 import {
@@ -290,14 +291,14 @@ function buildAutoFillResponse(
 
 let tokenRoundRobinIndex = 0;
 
-function selectTokenFromPool(tokens: TokenPoolItem[]): string | null {
-  if (tokens.length === 0) return null;
+function selectTokenItemsFromPool(tokens: TokenPoolItem[]): TokenPoolItem[] {
+  if (tokens.length === 0) return [];
   const idx = tokenRoundRobinIndex % tokens.length;
   tokenRoundRobinIndex++;
-  return tokens[idx].token;
+  return tokens.map((_, offset) => tokens[(idx + offset) % tokens.length]);
 }
 
-async function authenticate(request: Request, env: Env): Promise<string> {
+async function getAuthorizedTokenPool(request: Request, env: Env): Promise<TokenPoolItem[]> {
   const apiKeys = extractAPIKeys(request);
   if (apiKeys.length === 0) throw new Error("Missing Authorization header");
 
@@ -324,10 +325,53 @@ async function authenticate(request: Request, env: Env): Promise<string> {
   }
 
   if (pool.length === 0) throw new Error("No refresh tokens available in pool");
+  return pool;
+}
 
+function selectTokenFromPool(tokens: TokenPoolItem[]): string | null {
+  const items = selectTokenItemsFromPool(tokens);
+  return items.length > 0 ? items[0].token : null;
+}
+
+async function authenticate(request: Request, env: Env): Promise<string> {
+  const pool = await getAuthorizedTokenPool(request, env);
   const token = selectTokenFromPool(pool);
   if (!token) throw new Error("Failed to select token from pool");
   return token;
+}
+
+function isRecoverableTokenError(err: any): boolean {
+  const message = String(err?.message || err || "");
+  return (
+    message.includes("Stream response Content-Type invalid") ||
+    message.includes("refresh_token已过期") ||
+    message.includes("40102")
+  );
+}
+
+async function withTokenFallback<T>(
+  request: Request,
+  env: Env,
+  operation: (refreshToken: string) => Promise<T>,
+): Promise<T> {
+  const pool = await getAuthorizedTokenPool(request, env);
+  const candidates = selectTokenItemsFromPool(pool);
+  let lastError: any;
+
+  for (const candidate of candidates) {
+    try {
+      return await operation(candidate.token);
+    } catch (err) {
+      lastError = err;
+      if (!isRecoverableTokenError(err)) throw err;
+
+      if (candidate.id.startsWith("auto_guest_")) {
+        await deleteTokensFromPool(env.GLM_TOKENS, [candidate.id]);
+      }
+    }
+  }
+
+  throw lastError || new Error("No usable refresh tokens available in pool");
 }
 
 function authorizeAdmin(request: Request, env: Env): Response | null {
@@ -467,8 +511,12 @@ async function runAutoFill(
   const missingCount = Math.min(config.targetCount - currentLiveCount, AUTO_FILL_MAX_BATCH);
 
   try {
-    for (let i = 0; i < missingCount; i++) {
+    const maxAttempts = Math.min(AUTO_FILL_MAX_BATCH, Math.max(missingCount * 3, missingCount));
+    for (let attempts = 0; addedIds.length < missingCount && attempts < maxAttempts; attempts++) {
       const guestToken = await requestGuestRefreshToken(env);
+      const chatReady = await getTokenChatStreamStatus(guestToken.refreshToken);
+      if (!chatReady) continue;
+
       const id = `auto_guest_${guestToken.userId}`;
       await env.GLM_TOKENS.put(`rt:${id}`, guestToken.refreshToken);
       addedIds.push(id);
@@ -593,19 +641,20 @@ function sseResponse(stream: ReadableStream): Response {
 // ==================== Handlers ====================
 
 async function handleChatCompletions(request: Request, env: Env): Promise<Response> {
-  const refreshToken = await authenticate(request, env);
   const body = (await request.json()) as any;
 
   if (!Array.isArray(body.messages)) throw new Error("messages must be an array");
 
   const { model, conversation_id: convId, messages, stream, tools, tool_choice } = body;
-  if (stream) {
-    const glmStream = await createCompletionStream(messages, refreshToken, model, convId, 0, tools);
-    return sseResponse(glmStream);
-  } else {
+  return withTokenFallback(request, env, async (refreshToken) => {
+    if (stream) {
+      const glmStream = await createCompletionStream(messages, refreshToken, model, convId, 0, tools);
+      return sseResponse(glmStream);
+    }
+
     const result = await createCompletion(messages, refreshToken, model, convId, 0, tools);
     return jsonResponse(result);
-  }
+  });
 }
 
 async function handleClaudeMessages(request: Request, env: Env): Promise<Response> {

@@ -408,6 +408,22 @@ export async function createCompletion(messages: any[], refreshToken: string, mo
   });
 }
 
+export async function getTokenChatStreamStatus(refreshToken: string, model = "glm-5.1"): Promise<boolean> {
+  try {
+    const result = await createCompletion(
+      [{ role: "user", content: "只回复 OK" }],
+      refreshToken,
+      model,
+      "",
+      MAX_RETRY_COUNT,
+    );
+    const content = result?.choices?.[0]?.message?.content;
+    return typeof content === "string" && content.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
 export async function createCompletionStream(messages: any[], refreshToken: string, model = MODEL_NAME, refConvId = "", retryCount = 0, tools?: any[]): Promise<ReadableStream> {
   return (async () => {
     let processedMessages = convertToolMessages(messages);
@@ -457,18 +473,7 @@ export async function createCompletionStream(messages: any[], refreshToken: stri
     if (!contentType.includes("text/event-stream")) {
       const errText = await response.text();
       console.error("Invalid response Content-Type:", contentType, errText);
-      const encoder = new TextEncoder();
-      return new ReadableStream({
-        start(controller) {
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-            id: "", model: MODEL_NAME, object: "chat.completion.chunk",
-            choices: [{ index: 0, delta: { role: "assistant", content: "服务暂时不可用，第三方响应错误" }, finish_reason: "stop" }],
-            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-            created: unixTimestamp(),
-          })}\n\n`));
-          controller.close();
-        }
-      });
+      throw new Error(`Stream response Content-Type invalid: ${contentType}`);
     }
     return createTransStream(model, response.body!, (convId: string) => {
       removeConversation(convId, refreshToken, assistantId).catch(() => {});
