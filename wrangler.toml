@@ -4,9 +4,10 @@ compatibility_date = "2024-05-12"
 
 [vars]
 SIGN_SECRET = "8a1317a7468aa3ad86e997d08f3f31cb"
-# 管理 API 的保护密钥，建议部署前修改为随机强密码
-# 如未设置，管理接口将开放访问（不推荐用于生产环境）
-ADMIN_KEY = "changeme"
+# 管理 API 的保护密钥通过 Cloudflare Secret 设置：wrangler secret put ADMIN_KEY
+
+# 每日推理请求保护。按 UTC 日期计数，0 表示关闭保护。
+DAILY_USAGE_LIMIT = "800"
 
 # 自动补池配置（部署后也可通过管理面板动态修改）
 # 默认启用，部署后无需任何手动配置即可自动抓取游客 Token 维持服务
@@ -23,4 +24,4 @@ crons = ["0 * * * *"]
 # 然后将输出的 id 填入下方
 [[kv_namespaces]]
 binding = "GLM_TOKENS"
-id = ""  # <-- 替换为你创建 KV 后得到的 id
+id = "8b789b80d0ac4aecbb86b9a2f35dc262"

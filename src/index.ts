@@ -24,6 +24,7 @@ import { getAdminPanelHTML, getTokenPanelHTML, getChatPanelHTML } from "./admin-
 export interface Env {
   SIGN_SECRET?: string;
   ADMIN_KEY?: string;
+  DAILY_USAGE_LIMIT?: string;
   AUTO_FILL_ENABLED?: string;
   AUTO_FILL_TARGET?: string;
   AUTO_FILL_CRON?: string;
@@ -64,9 +65,37 @@ const DEFAULT_SIGN_SECRET = "8a1317a7468aa3ad86e997d08f3f31cb";
 const AUTO_FILL_CONFIG_KEY = "cfg:auto_fill";
 const AUTO_FILL_STATUS_KEY = "cfg:auto_fill_status";
 const AUTO_FILL_MAX_BATCH = 100;
+const DAILY_USAGE_KEY_PREFIX = "usage:daily:";
+const DAILY_USAGE_TTL_SECONDS = 60 * 60 * 48;
+const DEFAULT_DAILY_USAGE_LIMIT = 800;
+
+interface DailyUsageStatus {
+  enabled: boolean;
+  date: string;
+  key: string;
+  limit: number;
+  used: number;
+  remaining: number;
+  resetAt: string;
+}
+
+interface DailyUsageReservation {
+  status: DailyUsageStatus;
+  response?: Response;
+}
 
 const SUPPORTED_MODELS = [
   { id: "glm5", name: "GLM-5", object: "model", owned_by: "glm-free-api", description: "GLM-5 通用对话模型" },
+  { id: "glm-5", name: "GLM-5", object: "model", owned_by: "glm-free-api", description: "GLM-5 通用对话模型" },
+  { id: "glm-5.1", name: "GLM-5.1", object: "model", owned_by: "glm-free-api", description: "GLM-5.1 通用对话模型" },
+  { id: "glm-5.1-air", name: "GLM-5.1-Air", object: "model", owned_by: "glm-free-api", description: "GLM-5.1 Air 对话模型" },
+  { id: "glm-4.7", name: "GLM-4.7", object: "model", owned_by: "glm-free-api", description: "GLM-4.7 对话模型" },
+  { id: "glm-4.6", name: "GLM-4.6", object: "model", owned_by: "glm-free-api", description: "GLM-4.6 对话模型" },
+  { id: "glm-4.6v", name: "GLM-4.6V", object: "model", owned_by: "glm-free-api", description: "GLM-4.6V 对话模型" },
+  { id: "glm-4-flash", name: "GLM-4-Flash", object: "model", owned_by: "glm-free-api", description: "GLM-4 Flash 对话模型" },
+  { id: "glm-4-think", name: "GLM-4-Think", object: "model", owned_by: "glm-free-api", description: "GLM-4 Think 模式" },
+  { id: "glm-4-zero", name: "GLM-4-Zero", object: "model", owned_by: "glm-free-api", description: "GLM-4 Zero 模式" },
+  { id: "glm-4-deepresearch", name: "GLM-4-DeepResearch", object: "model", owned_by: "glm-free-api", description: "GLM-4 DeepResearch 模式" },
 ];
 
 const GEMINI_MODELS = [
@@ -103,6 +132,46 @@ function parseNonNegativeInt(value: unknown, fallback = 0): number {
   const num = Number(value);
   if (!Number.isFinite(num) || num < 0) return fallback;
   return Math.floor(num);
+}
+
+function getDailyUsageLimit(env: Env): number {
+  return parseNonNegativeInt(env.DAILY_USAGE_LIMIT, DEFAULT_DAILY_USAGE_LIMIT);
+}
+
+function getUtcDate(now = new Date()): string {
+  return now.toISOString().slice(0, 10);
+}
+
+function getDailyUsageResetAt(now = new Date()): string {
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1)).toISOString();
+}
+
+function isDailyUsageProtectedRequest(path: string, method: string): boolean {
+  if (method !== "POST") return false;
+  return (
+    path === "/v1/chat/completions" ||
+    path === "/v1/messages" ||
+    path === "/v1/images/generations" ||
+    path === "/v1/videos/generations" ||
+    /^\/v1beta\/models\/[^:]+:generateContent$/.test(path) ||
+    /^\/v1beta\/models\/[^:]+:streamGenerateContent$/.test(path)
+  );
+}
+
+async function getDailyUsageStatus(env: Env, now = new Date()): Promise<DailyUsageStatus> {
+  const date = getUtcDate(now);
+  const key = `${DAILY_USAGE_KEY_PREFIX}${date}`;
+  const limit = getDailyUsageLimit(env);
+  const used = parseNonNegativeInt(await env.GLM_TOKENS.get(key), 0);
+  return {
+    enabled: limit > 0,
+    date,
+    key,
+    limit,
+    used,
+    remaining: limit > 0 ? Math.max(limit - used, 0) : 0,
+    resetAt: getDailyUsageResetAt(now),
+  };
 }
 
 async function listAllKeys(kv: KVNamespace, prefix: string): Promise<Array<{ name: string }>> {
@@ -452,6 +521,64 @@ function errorResponse(message: string, status = 400): Response {
   return jsonResponse({ code: -1, message, data: null }, status);
 }
 
+function dailyUsageHeaders(status: DailyUsageStatus): Record<string, string> {
+  return {
+    "X-Daily-Usage-Enabled": status.enabled ? "true" : "false",
+    "X-Daily-Usage-Date": status.date,
+    "X-Daily-Usage-Limit": String(status.limit),
+    "X-Daily-Usage-Used": String(status.used),
+    "X-Daily-Usage-Remaining": String(status.remaining),
+    "X-Daily-Usage-Reset": status.resetAt,
+  };
+}
+
+function withDailyUsageHeaders(response: Response, status: DailyUsageStatus): Response {
+  const headers = new Headers(response.headers);
+  for (const [key, value] of Object.entries(dailyUsageHeaders(status))) {
+    headers.set(key, value);
+  }
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+function dailyUsageLimitResponse(status: DailyUsageStatus): Response {
+  return withDailyUsageHeaders(jsonResponse({
+    code: -1,
+    message: `Daily usage limit reached (${status.used}/${status.limit})`,
+    data: {
+      date: status.date,
+      limit: status.limit,
+      used: status.used,
+      remaining: status.remaining,
+      reset_at: status.resetAt,
+    },
+  }, 429), status);
+}
+
+async function reserveDailyUsageSlot(request: Request, env: Env, path: string): Promise<DailyUsageReservation | null> {
+  if (!isDailyUsageProtectedRequest(path, request.method)) return null;
+
+  const status = await getDailyUsageStatus(env);
+  if (!status.enabled) return { status };
+
+  if (status.used >= status.limit) {
+    return { status, response: dailyUsageLimitResponse(status) };
+  }
+
+  const used = status.used + 1;
+  await env.GLM_TOKENS.put(status.key, String(used), { expirationTtl: DAILY_USAGE_TTL_SECONDS });
+  return {
+    status: {
+      ...status,
+      used,
+      remaining: Math.max(status.limit - used, 0),
+    },
+  };
+}
+
 function sseResponse(stream: ReadableStream): Response {
   return new Response(stream, {
     headers: {
@@ -674,6 +801,45 @@ async function handleAdminTokenCheck(request: Request, env: Env): Promise<Respon
   return jsonResponse({ id, live });
 }
 
+async function handleAdminUsage(request: Request, env: Env): Promise<Response> {
+  const authError = authorizeAdmin(request, env);
+  if (authError) return authError;
+
+  const status = await getDailyUsageStatus(env);
+
+  if (request.method === "GET") {
+    return jsonResponse({
+      success: true,
+      usage: {
+        enabled: status.enabled,
+        date: status.date,
+        limit: status.limit,
+        used: status.used,
+        remaining: status.remaining,
+        reset_at: status.resetAt,
+      },
+    });
+  }
+
+  if (request.method === "DELETE") {
+    await env.GLM_TOKENS.delete(status.key);
+    return jsonResponse({
+      success: true,
+      message: "Daily usage counter reset",
+      usage: {
+        enabled: status.enabled,
+        date: status.date,
+        limit: status.limit,
+        used: 0,
+        remaining: status.limit,
+        reset_at: status.resetAt,
+      },
+    });
+  }
+
+  return errorResponse("Method not allowed", 405);
+}
+
 async function handleAdminAutoFill(request: Request, env: Env): Promise<Response> {
   const authError = authorizeAdmin(request, env);
   if (authError) return authError;
@@ -757,7 +923,12 @@ export default {
       return new Response(null, { status: 204, headers: corsHeaders() });
     }
 
+    let usageReservation: DailyUsageReservation | null = null;
+
     try {
+      usageReservation = await reserveDailyUsageSlot(request, env, path);
+      if (usageReservation?.response) return usageReservation.response;
+
       let response: Response;
 
       if (path === "/" && request.method === "GET") {
@@ -802,6 +973,8 @@ export default {
         response = await handleAdminToken(request, env);
       } else if (path === "/admin/token/check" && request.method === "POST") {
         response = await handleAdminTokenCheck(request, env);
+      } else if (path === "/admin/usage") {
+        response = await handleAdminUsage(request, env);
       } else if (path === "/admin/auto-fill") {
         response = await handleAdminAutoFill(request, env);
       } else if (path === "/admin/auto-fill/run") {
@@ -813,10 +986,11 @@ export default {
         response = errorResponse(message, 404);
       }
 
-      return response;
+      return usageReservation ? withDailyUsageHeaders(response, usageReservation.status) : response;
     } catch (err: any) {
       console.error(err);
-      return errorResponse(err.message || "Internal error", 500);
+      const response = errorResponse(err.message || "Internal error", 500);
+      return usageReservation ? withDailyUsageHeaders(response, usageReservation.status) : response;
     }
   },
 
