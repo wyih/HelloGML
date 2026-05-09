@@ -221,6 +221,10 @@ async function setCachedAccessToken(refreshToken: string, accessToken: string, r
   }));
 }
 
+export async function cacheAccessToken(refreshToken: string, accessToken: string) {
+  await setCachedAccessToken(refreshToken, accessToken, unixTimestamp() + ACCESS_TOKEN_EXPIRES);
+}
+
 async function deleteCachedAccessToken(refreshToken: string) {
   await getWorkerCache().delete(getTokenCacheKey(refreshToken));
 }
@@ -399,7 +403,7 @@ export async function createCompletion(messages: any[], refreshToken: string, mo
     removeConversation(answer.id, refreshToken, assistantId).catch(() => {});
     return answer;
   })().catch(async (err) => {
-    if (retryCount < MAX_RETRY_COUNT) {
+    if (retryCount < MAX_RETRY_COUNT && !String(err?.message || "").includes("Stream response Content-Type invalid")) {
       console.error(`Stream response error: ${err.stack || err.message}`);
       await sleep(RETRY_DELAY);
       return createCompletion(messages, refreshToken, model, refConvId, retryCount + 1, tools);
@@ -479,7 +483,7 @@ export async function createCompletionStream(messages: any[], refreshToken: stri
       removeConversation(convId, refreshToken, assistantId).catch(() => {});
     }, tools);
   })().catch(async (err) => {
-    if (retryCount < MAX_RETRY_COUNT) {
+    if (retryCount < MAX_RETRY_COUNT && !String(err?.message || "").includes("Stream response Content-Type invalid")) {
       console.error(`Stream response error: ${err.stack || err.message}`);
       await sleep(RETRY_DELAY);
       return createCompletionStream(messages, refreshToken, model, refConvId, retryCount + 1, tools);
